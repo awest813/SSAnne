@@ -251,6 +251,14 @@ void load_cfg_into_settings(RecompLauncherCSettings& s) {
 // startup_* getters read graphics_api/supersampling/antialiasing/window_mode/
 // audio_device.
 void write_settings_to_cfg(const RecompLauncherCSettings& s) {
+    // Host-only keys the recomp-ui launcher has no UI for. Carry their current
+    // values across the rewrite so hand-edited settings survive a launch.
+    static const char* const kHostOnlyKeys[] = {
+        "p1_pad", "p2_pad", "p3_pad", "p4_pad",
+        "stick_deadzone", "stick_sensitivity", "c_stick_threshold",
+    };
+    const auto old_cfg = read_cfg_map();
+
     std::ofstream f(pkmnstadium::exe_dir() / "launcher.cfg", std::ios::trunc);
     if (!f) {
         std::fprintf(stderr, "[recompui] WARN: cannot write launcher.cfg\n");
@@ -299,6 +307,17 @@ void write_settings_to_cfg(const RecompLauncherCSettings& s) {
     f << "audio_device=" << s.audio_device << "\n";
     f << "# autoplay=on|off : skip the launcher next time (recomp-ui skip flag).\n";
     f << "autoplay=" << (s.skip_launcher ? "on" : "off") << "\n";
+
+    f << "# Hand-edited controller settings (not shown in the launcher):\n";
+    f << "#   pN_pad=<SDL GUID or name substring> : which gamepad player N gets.\n";
+    f << "#   stick_deadzone=<0-90>      : analog stick deadzone, % of full tilt.\n";
+    f << "#   stick_sensitivity=<25-200> : analog stick scale, %.\n";
+    f << "#   c_stick_threshold=<5-95>   : % tilt for a stick bound to C-buttons.\n";
+    for (const char* k : kHostOnlyKeys) {
+        auto it = old_cfg.find(k);
+        if (it != old_cfg.end() && !it->second.empty())
+            f << k << "=" << it->second << "\n";
+    }
 }
 
 // ---- host enumeration for the launcher's dropdowns ------------------------
@@ -311,23 +330,6 @@ std::vector<std::string> enumerate_audio_devices() {
         if (nm != nullptr && nm[0] != '\0') out.emplace_back(nm);
     }
     return out;
-}
-
-// The instance id of the k-th connected SDL game controller (device-index
-// order). recomp-ui's C ABI returns player_src (None/Keyboard/Gamepad) but NOT
-// which specific pad each gamepad-player picked, so gamepad-players are assigned
-// pads by port order here. Enumerated after main re-inits SDL post-launcher.
-int nth_gamepad_instance(int k) {
-    if (k < 0) return -1;
-    SDL_GameControllerUpdate();
-    int seen = 0;
-    const int njoy = SDL_NumJoysticks();
-    for (int i = 0; i < njoy; ++i) {
-        if (!SDL_IsGameController(i)) continue;
-        if (seen == k) return static_cast<int>(SDL_JoystickGetDeviceInstanceID(i));
-        ++seen;
-    }
-    return -1;
 }
 
 } // namespace
@@ -436,11 +438,12 @@ PortAssignment port_assignment(int port) {
         pa.kind = DeviceKind::Keyboard;
     } else if (src == 2) {
         pa.kind = DeviceKind::Gamepad;
-        // Assign connected pads to gamepad-players in port order.
-        int ordinal = 0;
-        for (int j = 0; j < port; ++j)
-            if (g_settings.player_src[j] == 2) ++ordinal;
-        pa.gamepad_instance = nth_gamepad_instance(ordinal);
+        // recomp-ui's C ABI reports only "gamepad", not which pad, so the
+        // specific device comes from the hand-editable pN_pad hint. The runner
+        // matches it (or falls back to any free pad) and handles hotplug.
+        auto cfg = read_cfg_map();
+        const std::string key = "p" + std::to_string(port + 1) + "_pad";
+        if (cfg.count(key)) pa.gamepad_hint = cfg[key];
     }
     return pa;
 }
@@ -496,6 +499,38 @@ int startup_msaa() {
     if (val == "2x"  || val == "2") return 2;
     if (val == "8x"  || val == "8") return 8;
     return 4; // default / "4x"
+}
+
+// Parse a percentage (cfg or env), clamp it to [lo, hi]; fallback if malformed.
+static int parse_percent(const std::string& v, int lo, int hi, int fallback) {
+    const std::string t = trim(v);
+    if (t.empty()) return fallback;
+    char* end = nullptr;
+    const long n = std::strtol(t.c_str(), &end, 10);
+    if (end == t.c_str() || (*end != '\0' && *end != '%')) return fallback;
+    if (n < lo) return lo;
+    if (n > hi) return hi;
+    return static_cast<int>(n);
+}
+
+InputTuning startup_input_tuning() {
+    InputTuning t;
+    auto cfg = read_cfg_map();
+    auto pick = [&](const char* key, const char* env) -> std::string {
+        if (const char* e = std::getenv(env); e != nullptr && e[0] != '\0') return e;
+        auto it = cfg.find(key);
+        return it == cfg.end() ? std::string() : it->second;
+    };
+    auto pct_to_raw = [](int pct) { return pct * 32767 / 100; };
+
+    // Absent keys keep the historical raw defaults exactly (8000 is not a whole
+    // percentage, so only convert when the user actually set something).
+    const int dz = parse_percent(pick("stick_deadzone", "PSR_STICK_DEADZONE"), 0, 90, -1);
+    if (dz >= 0) t.stick_deadzone = pct_to_raw(dz);
+    t.stick_sensitivity = parse_percent(pick("stick_sensitivity", "PSR_STICK_SENSITIVITY"), 25, 200, 100);
+    const int ct = parse_percent(pick("c_stick_threshold", "PSR_C_STICK_THRESHOLD"), 5, 95, -1);
+    if (ct >= 0) t.c_stick_threshold = pct_to_raw(ct);
+    return t;
 }
 
 std::string startup_audio_device() {

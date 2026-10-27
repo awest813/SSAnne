@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -1482,7 +1483,11 @@ static void update_gfx(void*) {
 // real behavior, not a fake. Real input takes effect when a controller is
 // plugged in and SDL_GameControllerOpen succeeds.
 
-static SDL_GameController* g_pad = nullptr;
+// Legacy (no-launcher) pad. Read by get_n64_input/set_rumble on the game
+// thread and (re)assigned by poll_inputs on the gfx thread, hence atomic. A pad
+// that is unplugged is dropped (never closed, so a concurrent reader can't touch
+// freed memory) and the next attached pad is picked up automatically.
+static std::atomic<SDL_GameController*> g_pad{nullptr};
 
 // ---- per-port input routing (driven by the SS Anne launcher) --------------
 // When the launcher commits a config at PLAY, each N64 port (0..3) is routed to
@@ -1490,9 +1495,23 @@ static SDL_GameController* g_pad = nullptr;
 // model applies: port 0 = keyboard + first pad, ports 1-3 = Transfer-Pak idle.
 static std::atomic<bool> g_launcher_input_active{false};
 static pkmnstadium::recompui::DeviceKind g_port_kind[4] = {};
-static int g_port_instance[4] = {-1, -1, -1, -1};
 static bool g_port_enabled[4] = {false, false, false, false};
-static SDL_GameController* g_port_pad[4] = {nullptr, nullptr, nullptr, nullptr};
+static std::string g_port_pad_hint[4];
+static std::atomic<SDL_GameController*> g_port_pad[4] = {};
+
+// Analog-stick tuning (launcher.cfg / PSR_STICK_* env), resolved at startup.
+static int g_stick_deadzone = 8000;
+static int g_stick_sensitivity = 100;
+
+static void apply_input_tuning() {
+    const auto t = pkmnstadium::recompui::startup_input_tuning();
+    g_stick_deadzone = t.stick_deadzone;
+    g_stick_sensitivity = t.stick_sensitivity;
+    pkmnstadium::input::set_stick_axis_threshold(t.c_stick_threshold);
+    std::fprintf(stderr, "[input] stick deadzone=%d sensitivity=%d%% c-stick threshold=%d\n",
+                 g_stick_deadzone, g_stick_sensitivity, t.c_stick_threshold);
+    std::fflush(stderr);
+}
 
 // Snapshot the launcher's assignment into the per-port routing tables. Called
 // once from the boot thread when PLAY is clicked. SDL handles are opened lazily
@@ -1502,37 +1521,116 @@ static void apply_launcher_input_config() {
         const auto pa = pkmnstadium::recompui::port_assignment(port);
         g_port_enabled[port] = pa.enabled;
         g_port_kind[port] = pa.enabled ? pa.kind : pkmnstadium::recompui::DeviceKind::None;
-        g_port_instance[port] = pa.gamepad_instance;
+        g_port_pad_hint[port] = pa.gamepad_hint;
     }
     g_launcher_input_active.store(true);
     std::fprintf(stderr, "[input] launcher config applied: "
                  "P1=%d P2=%d P3=%d P4=%d (0=None 1=Kbd 2=Pad)\n",
                  (int)g_port_kind[0], (int)g_port_kind[1],
                  (int)g_port_kind[2], (int)g_port_kind[3]);
+    for (int port = 0; port < 4; ++port) {
+        if (!g_port_pad_hint[port].empty()) {
+            std::fprintf(stderr, "[input] P%d wants pad '%s'\n",
+                         port + 1, g_port_pad_hint[port].c_str());
+        }
+    }
     std::fflush(stderr);
 }
 
-// Open the SDL gamepad with the given instance id (find its device index).
-static SDL_GameController* open_pad_by_instance(int instance) {
-    // Reuse the handle if it's already open (e.g. opened for launcher nav).
-    if (SDL_GameController* existing = SDL_GameControllerFromInstanceID(instance)) {
-        return existing;
+static std::string lower_ascii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Does device index `i` match a pN_pad hint (exact SDL GUID string, or a
+// case-insensitive substring of the controller name)?
+static bool pad_matches_hint(int device_index, const std::string& hint) {
+    char guid[64] = {0};
+    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(device_index), guid, sizeof(guid));
+    if (lower_ascii(guid) == lower_ascii(hint)) return true;
+    const char* name = SDL_GameControllerNameForIndex(device_index);
+    return name != nullptr && lower_ascii(name).find(lower_ascii(hint)) != std::string::npos;
+}
+
+// Open (or reuse) the game controller at a device index and log it.
+static SDL_GameController* open_pad_at(int device_index, const char* who) {
+    SDL_GameController* pad = SDL_GameControllerOpen(device_index);
+    if (pad) {
+        char guid[64] = {0};
+        SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(pad)),
+                                  guid, sizeof(guid));
+        const char* name = SDL_GameControllerName(pad);
+        std::fprintf(stderr, "[input] %s: OPENED controller name='%s' guid=%s\n",
+                     who, name ? name : "(null)", guid);
+        std::fflush(stderr);
     }
+    return pad;
+}
+
+// Drop a pad that has been unplugged. Deliberately not closed: get_n64_input on
+// the game thread may still hold the pointer for the current read, and a
+// detached SDL controller just reads as idle. The leak is one handle per unplug.
+static void drop_if_detached(std::atomic<SDL_GameController*>& slot, const char* who) {
+    SDL_GameController* pad = slot.load();
+    if (pad && !SDL_GameControllerGetAttached(pad)) {
+        slot.store(nullptr);
+        std::fprintf(stderr, "[input] %s: controller disconnected\n", who);
+        std::fflush(stderr);
+    }
+}
+
+// Launcher mode: give every gamepad port without a live pad one that is
+// attached and not already used by another port. Ports with a pN_pad hint pick
+// first and only take a matching pad; the rest then take any free pad in device
+// order. Runs every poll, so unplug/replug and late-connected pads just work.
+static void assign_port_pads() {
+    using pkmnstadium::recompui::DeviceKind;
+    bool need = false;
+    for (int port = 0; port < 4; ++port) {
+        if (g_port_kind[port] != DeviceKind::Gamepad) continue;
+        char who[8];
+        std::snprintf(who, sizeof(who), "P%d", port + 1);
+        drop_if_detached(g_port_pad[port], who);
+        if (g_port_pad[port].load() == nullptr) need = true;
+    }
+    if (!need) return;
+
+    auto claimed = [](SDL_JoystickID id) {
+        for (int p = 0; p < 4; ++p) {
+            SDL_GameController* pad = g_port_pad[p].load();
+            if (pad && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) == id) return true;
+        }
+        return false;
+    };
+
     const int njoy = SDL_NumJoysticks();
-    for (int i = 0; i < njoy; ++i) {
-        if (SDL_IsGameController(i) && SDL_JoystickGetDeviceInstanceID(i) == instance) {
-            return SDL_GameControllerOpen(i);
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool hinted_pass = (pass == 0);
+        for (int port = 0; port < 4; ++port) {
+            if (g_port_kind[port] != DeviceKind::Gamepad || g_port_pad[port].load()) continue;
+            const std::string& hint = g_port_pad_hint[port];
+            if (hint.empty() == hinted_pass) continue;
+            for (int i = 0; i < njoy; ++i) {
+                if (!SDL_IsGameController(i) || claimed(SDL_JoystickGetDeviceInstanceID(i))) continue;
+                if (hinted_pass && !pad_matches_hint(i, hint)) continue;
+                char who[8];
+                std::snprintf(who, sizeof(who), "P%d", port + 1);
+                if (SDL_GameController* pad = open_pad_at(i, who)) {
+                    g_port_pad[port].store(pad);
+                    break;
+                }
+            }
         }
     }
-    return nullptr;
 }
 
 // Lazy-detect/open the first SDL gamepad. Safe to call from any of the
-// input callbacks â€” both poll_inputs and get_connected_device_info
+// input callbacks — both poll_inputs and get_connected_device_info
 // invoke this so the device status is correct even when osContInit
 // queries before the first poll cycle.
 static void ensure_pad_open() {
-    if (g_pad) return;
+    drop_if_detached(g_pad, "P1");
+    if (g_pad.load()) return;
     // SDL only sees newly-attached pads after the event subsystem has
     // pumped at least once. get_connected_device_info() is called by
     // libultra's osContInit BEFORE the runner enters its frame loop
@@ -1545,13 +1643,8 @@ static void ensure_pad_open() {
     int njoy = SDL_NumJoysticks();
     for (int i = 0; i < njoy; i++) {
         if (SDL_IsGameController(i)) {
-            g_pad = SDL_GameControllerOpen(i);
-            if (g_pad) {
-                const char* ctrl_name = SDL_GameControllerName(g_pad);
-                fprintf(stderr,
-                    "[input] OPENED controller: name='%s'\n",
-                    ctrl_name ? ctrl_name : "(null)");
-                fflush(stderr);
+            if (SDL_GameController* pad = open_pad_at(i, "P1")) {
+                g_pad.store(pad);
                 return;
             }
         }
@@ -1561,13 +1654,7 @@ static void ensure_pad_open() {
 static void poll_inputs() {
     SDL_GameControllerUpdate();
     if (g_launcher_input_active.load()) {
-        // Lazily open each port's assigned gamepad (on this gfx thread).
-        for (int port = 0; port < 4; ++port) {
-            if (g_port_kind[port] == pkmnstadium::recompui::DeviceKind::Gamepad &&
-                g_port_pad[port] == nullptr && g_port_instance[port] >= 0) {
-                g_port_pad[port] = open_pad_by_instance(g_port_instance[port]);
-            }
-        }
+        assign_port_pads();
     } else {
         ensure_pad_open();
     }
@@ -1595,7 +1682,7 @@ static bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_ou
         }
         switch (g_port_kind[controller_num]) {
             case pkmnstadium::recompui::DeviceKind::Gamepad:
-                pad = g_port_pad[controller_num];
+                pad = g_port_pad[controller_num].load();
                 break;
             case pkmnstadium::recompui::DeviceKind::Keyboard:
                 use_kb = true;
@@ -1610,7 +1697,7 @@ static bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_ou
         if (controller_num != 0) {
             return pkmnstadium::transfer_pak::has_transfer_pak(controller_num);
         }
-        pad = g_pad;
+        pad = g_pad.load();
         use_kb = true;
         primary_port = true;
     }
@@ -1654,6 +1741,13 @@ static bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_ou
     const Uint8* ks = use_kb ? SDL_GetKeyboardState(nullptr) : nullptr;
     pkmnstadium::input::accumulate(pad, ks, &b, &lx, &ly);
 
+    // User stick sensitivity (100% = unchanged), applied before saturation so
+    // a >100% setting reaches full deflection with less physical tilt.
+    if (g_stick_sensitivity != 100) {
+        lx = static_cast<int32_t>(static_cast<int64_t>(lx) * g_stick_sensitivity / 100);
+        ly = static_cast<int32_t>(static_cast<int64_t>(ly) * g_stick_sensitivity / 100);
+    }
+
     // Saturate the summed stick (a pad tilt plus keyboard keys can exceed the
     // axis range) before the deadzone rescale.
     if (lx >  32767) lx =  32767;
@@ -1670,16 +1764,16 @@ static bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_ou
     // rather than "confirm," which is what was making the title screen
     // soft-reset back to the boot sequence on any button press.
     //
-    // 8000 raw matches the C-button deadzone; well above typical resting
+    // 8000 raw (the default; launcher.cfg stick_deadzone / PSR_STICK_DEADZONE
+    // override it) matches the C-button deadzone; well above typical resting
     // drift but well below intentional tilts. The shared shim
     // (ultramodern osContGetReadData) expects a normalized [-1, 1] stick and
     // scales it to the N64 int8 range; apply_stick_deadzone is the single
     // shared producer of that value (a local copy here used to multiply by
     // 80.0f, which wrapped the shim's (int8_t)(127 * x) cast and inverted the
     // axis — masked only because Stadium menus drive on the D-pad).
-    constexpr int32_t LSTICK_DEADZONE = 8000;
-    *x_out =  ultramodern::input::apply_stick_deadzone(lx, LSTICK_DEADZONE);
-    *y_out = -ultramodern::input::apply_stick_deadzone(ly, LSTICK_DEADZONE);
+    *x_out =  ultramodern::input::apply_stick_deadzone(lx, g_stick_deadzone);
+    *y_out = -ultramodern::input::apply_stick_deadzone(ly, g_stick_deadzone);
 
     // Apply TCP override: OR buttons in, replace stick if non-zero.
     // claim_input arms the override flag (so osContInit reports
@@ -1723,9 +1817,9 @@ static bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_ou
 static void set_rumble(int controller_num, bool on) {
     SDL_GameController* pad = nullptr;
     if (g_launcher_input_active.load()) {
-        if (controller_num >= 0 && controller_num < 4) pad = g_port_pad[controller_num];
+        if (controller_num >= 0 && controller_num < 4) pad = g_port_pad[controller_num].load();
     } else if (controller_num == 0) {
-        pad = g_pad;
+        pad = g_pad.load();
     }
     if (!pad) return;
     SDL_GameControllerRumble(pad, on ? 0xFFFF : 0, on ? 0xFFFF : 0, 1000);
@@ -2092,6 +2186,9 @@ int main(int argc, char** argv) {
         // Lock in the launcher's per-port device config for input routing.
         apply_launcher_input_config();
     }
+
+    // Stick deadzone / sensitivity / C-stick threshold (launcher.cfg + env).
+    apply_input_tuning();
 
     reset_audio(48000);
     std::fprintf(stderr, "[PSR] reset_audio done\n"); std::fflush(stderr);

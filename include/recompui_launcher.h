@@ -20,7 +20,18 @@ enum class DeviceKind { None = 0, Keyboard = 1, Gamepad = 2 };
 struct PortAssignment {
     bool enabled = false;                 // port responds (has a device or a Transfer Pak)
     DeviceKind kind = DeviceKind::None;   // input source
-    int gamepad_instance = -1;            // SDL_JoystickID when kind == Gamepad, else -1
+    // Which pad this gamepad-player wants (launcher.cfg pN_pad): an SDL joystick
+    // GUID string or a case-insensitive name substring. Empty = any free pad.
+    // The runner resolves it to a live controller and re-resolves on hotplug.
+    std::string gamepad_hint;
+};
+
+// Analog-stick tuning, from launcher.cfg (+ PSR_* env overrides). All values are
+// raw SDL axis units (0..32767) except sensitivity, which is a percentage.
+struct InputTuning {
+    int stick_deadzone      = 8000; // stick_deadzone / PSR_STICK_DEADZONE (percent in cfg)
+    int stick_sensitivity   = 100;  // stick_sensitivity / PSR_STICK_SENSITIVITY (percent)
+    int c_stick_threshold   = 8000; // c_stick_threshold / PSR_C_STICK_THRESHOLD (percent in cfg)
 };
 
 // Run the pre-boot launcher window. Blocks until the user launches or quits.
@@ -42,6 +53,7 @@ std::string startup_graphics_api();   // "auto" | "vulkan" | "d3d12"
 int         startup_ds_option();      // supersampling depth: 1 | 2 | 4
 int         startup_msaa();           // MSAA sample count: 0 | 2 | 4 | 8
 std::string startup_audio_device();   // device-name substring; "" = system default
+InputTuning startup_input_tuning();
 
 } // namespace pkmnstadium::recompui
 

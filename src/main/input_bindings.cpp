@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -160,13 +161,18 @@ void reset_defaults_locked() {
     set_default(Device::Controller, N64Input::STICK_RIGHT,axis_pos(SDL_CONTROLLER_AXIS_LEFTX));
 }
 
+// Activation threshold for a stick axis acting as a digital input (e.g. the
+// right stick driving the C-buttons). Defaults to the historical 8000; tunable
+// via set_stick_axis_threshold() (launcher.cfg c_stick_threshold).
+std::atomic<int> g_stick_axis_threshold{kDefaultStickAxisThreshold};
+
 // Activation threshold for an axis acting as a digital input. Triggers rest at
 // 0 and read up to 32767, so a half-press (0x4000) trips Z; stick axes use the
-// historical C-button deadzone of 8000.
+// configurable C-button threshold.
 int axis_threshold(int axis) {
     if (axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
         return 0x4000;
-    return 8000;
+    return g_stick_axis_threshold.load(std::memory_order_relaxed);
 }
 
 bool field_active_digital(const InputField& f, SDL_GameController* pad, const uint8_t* ks) {
@@ -319,7 +325,7 @@ bool     is_stick(N64Input in) { return meta(in).stick; }
 const char* input_key(N64Input in)   { return meta(in).key; }
 const char* input_label(N64Input in) { return meta(in).label; }
 
-const InputField& get_binding(Device dev, N64Input in, int idx) {
+InputField get_binding(Device dev, N64Input in, int idx) {
     std::scoped_lock lk(g_mutex);
     return g_bindings[static_cast<int>(dev)][static_cast<int>(in)][idx];
 }
@@ -332,6 +338,11 @@ void set_binding(Device dev, N64Input in, int idx, InputField field) {
 void reset_defaults() {
     std::scoped_lock lk(g_mutex);
     reset_defaults_locked();
+}
+
+void set_stick_axis_threshold(int raw) {
+    raw = std::clamp(raw, 1, 32767);
+    g_stick_axis_threshold.store(raw, std::memory_order_relaxed);
 }
 
 std::string field_to_string(const InputField& field) {
@@ -418,7 +429,8 @@ void save() {
     f << "# PokemonStadiumRecomp input bindings - managed by the launcher's\n";
     f << "# per-controller rebinding menu. Format: <dev>.<input>.<idx>=<field>\n";
     f << "#   dev:   kb (keyboard) | pad (controller, shared by all gamepads)\n";
-    f << "#   field: key:<scancode> | button:<n> | axis+:<n> | axis-:<n> | none\n";
+    f << "#   field: key:<scancode> | button:<n> | axis+:<n> | axis-:<n> |\n";
+    f << "#          joybtn:<n> | joyaxis+:<n> | joyaxis-:<n> | none\n";
     for (int d = 0; d < kDeviceCount; ++d) {
         for (int i = 0; i < kInputCount; ++i) {
             for (int b = 0; b < bindings_per_input; ++b) {

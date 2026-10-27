@@ -155,7 +155,9 @@ game (used for regression runs).
 
 ## Controls
 
-Default bindings (per-button remapping in the launcher is planned).
+Default bindings are listed below. Every button can be remapped from the SS
+Anne launcher's rebind page; bindings are saved to `input.cfg` next to the exe
+(one keyboard layout and one gamepad layout, shared by all players).
 
 **Game controller** (Xbox-style layout; DualSense / DualShock map the same way):
 
@@ -174,6 +176,33 @@ miss — issue #8. L and R are now the bumpers.)
 
 **Keyboard:** `X`→A, `Z`→B, `Enter`→Start, `Q`→L, `E`→R, `Left-Shift`/`Space`→Z,
 arrow keys→D-Pad, `W`/`A`/`S`/`D`→Control Stick, `I`/`K`/`J`/`L`→C-Up/Down/Left/Right.
+
+**Controller hotplug.** Unplugging a controller mid-game no longer leaves its
+player dead: the player goes idle and picks up a controller again as soon as
+one is plugged in (the same one, or any controller no other player is using).
+
+**Choosing which controller each player gets.** By default, gamepad players
+take connected controllers in the order SDL lists them. To pin a specific
+controller to a player, add `pN_pad=` to `launcher.cfg`, with either part of
+the controller's name or its SDL GUID (both are printed in the log as
+`[input] P1: OPENED controller name='…' guid=…`):
+
+```ini
+p1_pad=Xbox
+p2_pad=8BitDo 64
+```
+
+**Stick tuning** (`launcher.cfg`, or the matching environment variable for one
+run):
+
+| Key | Env var | Default | Meaning |
+|-----|---------|---------|---------|
+| `stick_deadzone` | `PSR_STICK_DEADZONE` | ~24 | Analog-stick deadzone, % of full tilt (0–90). Raise it if the stick drifts. |
+| `stick_sensitivity` | `PSR_STICK_SENSITIVITY` | 100 | Analog-stick scale, % (25–200). Above 100 reaches full tilt sooner. |
+| `c_stick_threshold` | `PSR_C_STICK_THRESHOLD` | ~24 | How far (%) a stick bound to the C-buttons must tilt to press (5–95). |
+
+These keys aren't in the launcher UI, but the launcher keeps them when it
+rewrites `launcher.cfg`.
 
 ## Configuration
 

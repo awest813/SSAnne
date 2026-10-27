@@ -106,8 +106,8 @@ bug · **P2** robustness/security · **P3** portability · **P4** docs/hygiene �
 - [ ] **G-21 Struct mirror mismatch.** `post_mortem.cpp:173-184` (32 B) vs
       `debug_server.cpp:1091-1105` (40 B) mirror the same mesg struct — one always reports
       `size_mismatch`; op names 9/10 missing in post_mortem.
-- [ ] **G-22 `input_bindings::get_binding` returns a reference after releasing the lock**
-      (`input_bindings.cpp:322-325`).
+- [x] **G-22 `input_bindings::get_binding` returned a reference after releasing the lock.**
+      Fixed: returns a copy.
 - [ ] **G-23 `UNIMPL_LIBULTRA` aborts on `rmonPrintf`** and other rarely-hit libultra
       calls (`extras.c:163-168`); every `recomp_unhandled_*` aborts (`extras.c:81-124`).
 - [ ] **G-24 Opt-in WASAPI output can go silent.** Reports success before device init
@@ -182,11 +182,15 @@ bug · **P2** robustness/security · **P3** portability · **P4** docs/hygiene �
 
 ## P5 — Feature backlog
 
-- [ ] **G-42 Input:** per-player bindings (one shared kb + one shared pad table today,
-      `input_bindings.cpp:420,441-467`); choose which pad goes to which port (currently
-      enumeration order, `recompui_launcher.cpp:316-319`); controller hotplug (no
-      `SDL_CONTROLLERDEVICEADDED/REMOVED` handling); configurable deadzone/sensitivity
-      (hardcoded 8000, `main.cpp:1666-1682`); hotkey config (`config_path = nullptr`).
+- [ ] **G-42 Input.** Done: controller hotplug (unplug/replug, late-connected pads),
+      per-player controller choice via `launcher.cfg` `pN_pad=` (name substring or
+      SDL GUID), configurable stick deadzone / sensitivity / C-stick threshold
+      (`stick_deadzone`, `stick_sensitivity`, `c_stick_threshold`, `PSR_STICK_*`),
+      README documents the rebind page. Still open: per-player binding tables
+      (one shared kb + one shared pad table, `input_bindings.cpp`) and a launcher
+      UI for picking the pad / tuning — both need recomp-ui changes (its
+      `n64_binds.c` mirrors the `input.cfg` format, and its C ABI reports only
+      "gamepad", not which one); hotkey config (`config_path = nullptr`).
 - [ ] **G-43 Launcher persistence:** volume, `audio_freq`, `enable_audio`,
       `window_scale` have defaults but are never saved/loaded
       (`recompui_launcher.cpp:169-173,253-302`); `pN_enabled` / `pN_tpak` are written but

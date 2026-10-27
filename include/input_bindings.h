@@ -92,13 +92,20 @@ const char* input_key(N64Input in);
 // Human label for the rebind UI (e.g. "A", "C-Up", "Stick Left").
 const char* input_label(N64Input in);
 
-// Table accessors. idx in [0, bindings_per_input).
-const InputField& get_binding(Device dev, N64Input in, int idx);
+// Table accessors. idx in [0, bindings_per_input). get_binding returns a copy
+// so the caller never holds a reference into the table after the lock drops.
+InputField get_binding(Device dev, N64Input in, int idx);
 void              set_binding(Device dev, N64Input in, int idx, InputField field);
 
 // Reset both tables to the built-in defaults (which reproduce PSR's historical
 // hardcoded layout exactly, so a fresh build with no input.cfg is unchanged).
 void reset_defaults();
+
+// Raw axis magnitude (1..32767) past which a gamepad STICK axis bound to a
+// digital input (e.g. right stick -> C-buttons) counts as pressed. Triggers keep
+// their fixed half-press threshold. Thread-safe; takes effect on the next poll.
+constexpr int kDefaultStickAxisThreshold = 8000;
+void set_stick_axis_threshold(int raw);
 
 // Human-readable name of a bound field for the UI (e.g. "X", "Button A",
 // "LT", "R-Stick Up"). Returns "—" for an empty field.
